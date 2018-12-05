@@ -1,0 +1,214 @@
+* task_base 源码分析
+  在分析 [[file:task.org][task]] 时，发现存在 task_base 对象，于是决定先分析task_base, 发现其篇幅很长，因此单独成文。
+task_base 不在 =task_base.h= 文件中声明，而是在 =scheduler_fwd.h= 中声明，但定义在 =task_base.h= 中。
+为什么这么说呢， 因为在 =task_base_vtable= 定义用到了 =task_base= 对象，而在此前并没有它的声明。
+#+BEGIN_SRC C++
+// line 56
+// Reference counted pointer to task data
+struct task_base;
+typedef ref_count_ptr<task_base> task_ptr;
+#+END_SRC
+
+** task_base 相关函数
+   在找到 =task_base= 声明后，回到 =task_base.h= 文件看看包含哪些基本函数。
+
+*** 任务状态
+#+BEGIN_SRC C++
+enum class task_state: unsigned char {
+	pending, // Task has not completed yet
+	locked, // Task is locked (used by event_task to prevent double set)
+	unwrapped, // Task is waiting for an unwrapped task to finish
+	completed, // Task has finished execution and a result is available
+	canceled // Task has been canceled and an exception is available
+};
+#+END_SRC
+Task 一共预定义了五种状态：未决、加锁、打开、完成、取消。
+
+检查是否完成：
+#+BEGIN_SRC C++
+inline bool is_finished(task_state s)
+{
+	return s == task_state::completed || s == task_state::canceled;
+}
+#+END_SRC
+
+*** 虚函数表
+#+BEGIN_SRC C++
+struct task_base_vtable {
+	// 销毁任务
+	void (*destroy)(task_base*) LIBASYNC_NOEXCEPT;
+
+	// 开始任务
+	void (*run)(task_base*) LIBASYNC_NOEXCEPT;
+
+	// 异常取消
+	void (*cancel)(task_base*, std::exception_ptr&&) LIBASYNC_NOEXCEPT;
+
+	// 任务调试
+	void (*schedule)(task_base* parent, task_ptr t);
+};
+#+END_SRC
+为 task 对象定义的动态调度虚函数，减少代码量。
+
+*** 父结构 ref_count_base
+    用来统计引用计数的功能模块.
+#+BEGIN_SRC C++
+// 默认删除器--直接使用 delete 销毁对象
+template<typename T>
+struct default_deleter {
+	static void do_delete(T* p)
+	{
+		delete p;
+	}
+};
+
+// base 对象相关的超类: 用来管理引用计数
+template<typename T, typename Deleter = default_deleter<T>>
+struct ref_count_base {
+	std::atomic<std::size_t> ref_count;
+
+	// 默认实例化1个引用
+	explicit ref_count_base(std::size_t count = 1)
+		: ref_count(count) {}
+
+    // 原子操作使用自由序内存模型增加引用
+	void add_ref(std::size_t count = 1)
+	{
+		ref_count.fetch_add(count, std::memory_order_relaxed);
+	}
+
+    // 删除引用时，使用获取释放序内存模型
+	void remove_ref(std::size_t count = 1)
+	{
+		if (ref_count.fetch_sub(count, std::memory_order_release) == count) {
+			std::atomic_thread_fence(std::memory_order_acquire);
+			Deleter::do_delete(static_cast<T*>(this));
+		}
+	}
+	void add_ref_unlocked()
+	{
+		ref_count.store(ref_count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
+	bool is_unique_ref(std::memory_order order)
+	{
+		return ref_count.load(order) == 1;
+	}
+};
+#+END_SRC
+这段代码实现了基本的引用管理， =add_ref_unlocked= 每次无锁地增加 =1= 个引用， =add_ref= 增加 =count= 个引用。
+=remove_ref= 每次减去 =count= 个引用， 这里注意：删除引用可能会引起销毁对象，所以用获取释放内存序。
+=fetch_add= 和 =fetch_sub= 函数的返回值为原子对象的旧值。
+
+*** task_base 定义
+    =task_base= 删除器 =task_base_deleter= 的定义
+#+BEGIN_SRC C++
+struct task_base_deleter {
+	static void do_delete(task_base* p)
+	{
+		// 通过调度自己的 destroy 销毁自己
+		p->vtable->destroy(p);
+	}
+};
+#+END_SRC
+
+*** task_base 对象
+#+BEGIN_SRC C++
+// async++.h/LIBASYNC_CACHELINE_ALIGN
+// __attribute__ 是 C 语言的编译期属性关键字，aligned 参数告诉编译器材，分配内存时
+// 按照给定的大小进行分配， LIBASYNC_CACHELINE_SIZE 预定义为 64
+// 猜测这里为了避免父子类对象大小不等时多态的未定义行为。
+# define LIBASYNC_CACHELINE_ALIGN __attribute__((aligned(LIBASYNC_CACHELINE_SIZE)))
+
+// 特定属性的 task_base 声明
+struct LIBASYNC_CACHELINE_ALIGN task_base: public ref_count_base<task_base, task_base_deleter> {
+	// 任务状态
+	std::atomic<task_state> state;
+
+	// 是否获取任务的标志
+	bool event_task_got_task;
+
+	// 线程安全的 task_ptr 向量, 作为该任务的后继任务
+	continuation_vector continuations;
+
+	// 动态调度的虚函数表
+	const task_base_vtable* vtable;
+
+	// 重载 operator new 操作， 使用对齐的内存分配
+	static void* operator new(std::size_t size)
+	{
+		return aligned_alloc(size, LIBASYNC_CACHELINE_SIZE);
+	}
+	static void operator delete(void* ptr)
+	{
+		aligned_free(ptr);
+	}
+
+	// 初始化未决状态
+	task_base()
+		: state(task_state::pending) {}
+
+	// 检查任务是否就绪
+	bool ready() const
+	{
+		return is_finished(state.load(std::memory_order_acquire));
+	}
+
+	// 运行一个后继任务
+	template<typename Sched>
+	void run_continuation(Sched& sched, task_ptr&& cont)
+	{
+		LIBASYNC_TRY {
+			detail::schedule_task(sched, std::move(cont));
+		} LIBASYNC_CATCH(...) {
+			// 直接取消不是最好的，但是可以避免异常泄漏
+			cont->vtable->cancel(cont.get(), std::current_exception());
+		}
+	}
+
+    // 运行所有后继任务，通常是空的或加锁的任务用来获取 future
+	void run_continuations()
+	{
+		continuations.flush_and_lock([this](task_ptr t) {
+			const task_base_vtable* vtable = t->vtable;
+			vtable->schedule(this, std::move(t));
+		});
+	}
+
+	// 添加后继任务
+	template<typename Sched>
+	void add_continuation(Sched& sched, task_ptr cont)
+	{
+		// 检查当前任务是否完成
+		task_state current_state = state.load(std::memory_order_relaxed);
+		if (!is_finished(current_state)) {
+            // 加锁成功等待调度，失败说明当前任务完成，直接调度
+			if (continuations.try_add(std::move(cont)))
+				return;
+		}
+
+		// 直接调度
+		std::atomic_thread_fence(std::memory_order_acquire);
+		run_continuation(sched, std::move(cont));
+	}
+
+	// 完成任务释放锁并调度所有阻塞的任务
+	void finish()
+	{
+		state.store(task_state::completed, std::memory_order_release);
+		run_continuations();
+	}
+
+	// 等待当前任务完成
+	task_state wait()
+	{
+		task_state s = state.load(std::memory_order_acquire);
+		if (!is_finished(s)) {
+			wait_for_task(this);
+			s = state.load(std::memory_order_relaxed);
+		}
+		return s;
+	}
+};
+#+END_SRC
+每个 =task_base= 维护一个后继任务向量，初始化为未决状态, 然后等待先驱任务的调度, 完成之后
+调度后继任务。

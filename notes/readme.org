@@ -1,0 +1,93 @@
+* async++ 并发库原码分析
+  Aysync++ 是一个轻量级的 =C++= 并发库。采用 =C++11= 标准，功能和微软的 [[http://msdn.microsoft.com/en-us/library/dd492418.aspx][PPL 库]] 差不多，但是跨平台。
+
+** 主要的类
+#+BEGIN_SRC C++
+// Some forward declarations
+namespace async {
+
+template<typename Result>
+class task;
+template<typename Result>
+class shared_task;
+template<typename Result>
+class event_task;
+
+} // namespace async
+#+END_SRC
+async 空间声明了 =tast= 、 =shared_task= 、 以及 =event_task= 三个类。接下来的源码分析将从这三个类开始
+展开，慢慢探索实现的细节。
+
+** 从简单例子入手
+   先上代码：
+#+BEGIN_SRC C++
+#include <iostream>
+#include <async++.h>
+
+int main()
+{
+    auto task1 = async::spawn([] {
+        std::cout << "Task 1 executes asynchronously" << std::endl;
+    });
+    auto task2 = async::spawn([]() -> int {
+        std::cout << "Task 2 executes in parallel with task 1" << std::endl;
+        return 42;
+    });
+    auto task3 = task2.then([](int value) -> int {
+        std::cout << "Task 3 executes after task 2, which returned "
+                  << value << std::endl;
+        return value * 3;
+    });
+    auto task4 = async::when_all(task1, task3);
+    auto task5 = task4.then([](std::tuple<async::task<void>,
+                                          async::task<int>> results) {
+        std::cout << "Task 5 executes after tasks 1 and 3. Task 3 returned "
+                  << std::get<1>(results).get() << std::endl;
+    });
+
+    task5.get();
+    std::cout << "Task 5 has completed" << std::endl;
+
+    async::parallel_invoke([] {
+        std::cout << "This is executed in parallel..." << std::endl;
+    }, [] {
+        std::cout << "with this" << std::endl;
+    });
+
+    async::parallel_for(async::irange(0, 5), [](int x) {
+        std::cout << x;
+    });
+    std::cout << std::endl;
+
+    int r = async::parallel_reduce({1, 2, 3, 4}, 0, [](int x, int y) {
+        return x + y;
+    });
+    std::cout << "The sum of {1, 2, 3, 4} is " << r << std::endl;
+}
+
+// Output (order may vary in some places):
+// Task 1 executes asynchronously
+// Task 2 executes in parallel with task 1
+// Task 3 executes after task 2, which returned 42
+// Task 5 executes after tasks 1 and 3. Task 3 returned 126
+// Task 5 has completed
+// This is executed in parallel...
+// with this
+// 01234
+// The sum of {1, 2, 3, 4} is 10
+#+END_SRC
+如代码所示：展示了，一个并发的基本过程：
+
+- 创建 =Task1= 、 =Task2= 并行运行。
+- 在 =Task2= 的基础上创建 =Task3= 。表明 =Task3= 在 =Task2= 后运行。
+- =Task4= 等待 =Task1= 、 =Task3= 运行完成。
+- =Task5= 在 =Task4= 运行完成后运行。
+- =for= 并发、求和并发。
+
+过程如图：
+[[file:images/async01.png]]
+
+** 源码分析
+
+*** Task 类
+[[file:task_base.org][1. task_base 源码分析]]
