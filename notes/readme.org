@@ -91,3 +91,5 @@ int main()
 
 *** Task 类
 [[file:task_base.org][1. task_base 源码分析]]
+
+[[file:result_func.org][2. 任务的结果和函数]]

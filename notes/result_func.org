@@ -1,0 +1,376 @@
+<2018-12-05 Wed>
+* 任务的结果和函数
+  根据 =task_base.h= 文件中的声明，任务的结果和函数分别为 =task_result_holder=
+和 =func_base= 中。
+** 结果
+#+BEGIN_SRC C++
+// 结果类型具体的任务对象
+template<typename Result>
+struct task_result_holder: public task_base {
+    // 结果为正常结果或异常结果，sched 被移除到虚函数表中
+	union{
+        // std::alignment_of 获取类型对齐字节
+        // std::aligned_storage 萃取类型的该有的 POD 大小
+        /* Example:
+           class __attribute__((aliged (64))) A;      // A 是 64 字节对齐的类型
+           std::<<cout << st::alignment_of<A>::value;  // output: 64
+           std::aligned_storage<sizeof(A), std::alignment_of<a>::value>::type a;
+                                                       // a 也将是 64 字节对齐的
+         */
+        // 这样做的好处是可以不初始化获知 result 应该分配的大小
+		typename std::aligned_storage<sizeof(Result), std::alignment_of<Result>::value>::type result;
+		std::aligned_storage<sizeof(std::exception_ptr), std::alignment_of<std::exception_ptr>::value>::type except;
+
+		// Scheduler that should be used to schedule this task. The scheduler
+		// type has been erased and is held by vtable->schedule.
+		void* sched;
+	};
+
+	template<typename T>
+	void set_result(T&& t)
+	{
+        // 前面提到 result 未初始化，因此在调用 Result 的构造函数进行初始化并取得实例的引用
+        // 动态堆内存分配关键字 new 操作包括两步：1. operate new 分配空间， 2. new() 初始化。
+        // 所以如果想自己进行内存管理(内存池)，只要重载 operate new 即可， 因为 new 关键字不能重载
+		new(&result) Result(std::forward<T>(t));
+	}
+    // reinterpret_cast 字节级的类型转换，参数的作用是用来实现重载
+	template<typename T>
+	Result&& get_result(const task<T>&)
+	{
+        // 这里表示 task 的Reslut不可以有多个实例(复制)，需要转移所有权
+		return std::move(*reinterpret_cast<Result*>(&result));
+	}
+	template<typename T>
+	const Result& get_result(const shared_task<T>&)
+	{
+		return *reinterpret_cast<Result*>(&result);
+	}
+
+	// Destroy the result
+	~task_result_holder()
+	{
+		// Result is only present if the task completed successfully
+		if (state.load(std::memory_order_relaxed) == task_state::completed)
+			reinterpret_cast<Result*>(&result)->~Result();
+	}
+};
+#+END_SRC
+技巧：作者通过萃取类型避免不必要的初始化，可以提升性能。这里应该考虑到所有类型的大小，所以使用
+内存字节对齐，这样在 reinterpret_cast 时就不会出现截断而导致未定义行为。
+*** 引用偏特化
+#+BEGIN_SRC C++
+// Specialization for references
+template<typename Result>
+struct task_result_holder<Result&>: public task_base {
+	union {
+		// 直接定义指针，反正所有类型的指针一样大
+		Result* result;
+		std::aligned_storage<sizeof(std::exception_ptr), std::alignment_of<std::exception_ptr>::value>::type except;
+		void* sched;
+	};
+
+	void set_result(Result& obj)
+	{
+        // 获得引用的真实地址
+		result = std::addressof(obj);
+	}
+
+	template<typename T>
+	Result& get_result(const task<T>&)
+	{
+		return *result;
+	}
+	template<typename T>
+	Result& get_result(const shared_task<T>&)
+	{
+		return *result;
+	}
+};
+#+END_SRC
+*** 万能指针偏特化
+#+BEGIN_SRC C++
+// Specialization for void
+template<>
+struct task_result_holder<fake_void>: public task_base {
+	union {
+		std::aligned_storage<sizeof(std::exception_ptr), std::alignment_of<std::exception_ptr>::value>::type except;
+		void* sched;
+	};
+
+	void set_result(fake_void) {}
+
+	// Get the result as fake_void so that it can be passed to set_result and
+	// continuations
+	template<typename T>
+	fake_void get_result(const task<T>&)
+	{
+		return fake_void();
+	}
+	template<typename T>
+	fake_void get_result(const shared_task<T>&)
+	{
+		return fake_void();
+	}
+};
+#+END_SRC
+*** 具体的 task_result
+    上面是 result 的持有类，现在是 task_result
+#+BEGIN_SRC C++
+template<typename Result>
+struct task_result: public task_result_holder<Result> {
+	// Virtual function table for task_result
+	static const task_base_vtable vtable_impl;
+	task_result()
+	{
+         // 虚函数表指向具体实现
+		this->vtable= &vtable_impl;
+	}
+
+	// Destroy the exception
+	~task_result()
+	{
+		// Exception is only present if the task was canceled
+		if (this->state.load(std::memory_order_relaxed) == task_state::canceled)
+			reinterpret_cast<std::exception_ptr*>(&this->except)->~exception_ptr();
+	}
+
+	// 当前任务出现异常直接退出，并启动后继任务
+	void cancel_base(std::exception_ptr&& except)
+	{
+		set_exception(std::move(except));
+		this->state.store(task_state::canceled, std::memory_order_release);
+		this->run_continuations();
+	}
+
+	// 将异常保存到 holder 中
+	void set_exception(std::exception_ptr&& except)
+	{
+		new(&this->except) std::exception_ptr(std::move(except));
+	}
+
+	// 获取异常
+	std::exception_ptr& get_exception()
+	{
+		return *reinterpret_cast<std::exception_ptr*>(&this->except);
+	}
+
+	// 抛出异常
+	void wait_and_throw()
+	{
+		if (this->wait() == task_state::canceled)
+			LIBASYNC_RETHROW_EXCEPTION(get_exception());
+	}
+
+	// 销毁任务
+	static void destroy(task_base* t) LIBASYNC_NOEXCEPT
+	{
+		delete static_cast<task_result<Result>*>(t);
+	}
+};
+// 设置虚函数
+template<typename Result>
+const task_base_vtable task_result<Result>::vtable_impl = {
+	task_result<Result>::destroy, // destroy
+	nullptr, // run
+	nullptr, // cancel
+	nullptr // schedule
+};
+#+END_SRC
+** 任务函数
+*** 函数所有者
+#+BEGIN_SRC C++
+// func_holder 默认模板
+template<typename Func, typename = void>
+struct func_holder {
+	typename std::aligned_storage<sizeof(Func), std::alignment_of<Func>::value>::type func;
+
+	Func& get_func()
+	{
+		return *reinterpret_cast<Func*>(&func);
+	}
+	template<typename... Args>
+	void init_func(Args&&... args)
+	{
+		new(&func) Func(std::forward<Args>(args)...);
+	}
+	void destroy_func()
+	{
+		get_func().~Func();
+	}
+};
+// func_holder 偏特化，当 Func 为空时匹配
+// is_empty: 当非 union 的对象除了静态数据成员其它位域为 0 时返回 true, 即是空对象。
+// enable_if:
+//  原型： std::enable_if<bool B, class T=void> struct enable_if;
+//  当条件 B 为 true 时， enable_if 会有 type 成员。这样的好处是基于类型特性条件性地从重载决议移除函数
+//  如本例：当 Func 对象为空时，自动推导就会匹配这这个定义而不是上面的默认定义。
+//  本例第二个参数没有实用意义，只是用来重载实现偏特化。
+template<typename Func>
+struct func_holder<Func, typename std::enable_if<std::is_empty<Func>::value>::type> {
+	Func& get_func()
+	{
+		return *reinterpret_cast<Func*>(this);
+	}
+	template<typename... Args>
+	void init_func(Args&&... args)
+	{
+		new(this) Func(std::forward<Args>(args)...);
+	}
+	void destroy_func()
+	{
+		get_func().~Func();
+	}
+};
+#+END_SRC
+*** 任务函数
+    这个类的作用是将之前的结果和函数所有者结合成完整的任务。但是还不算一个完整的任务，
+因为调度器还没有对应的定义。
+#+BEGIN_SRC C++
+template<typename Sched, typename Func, typename Result>
+struct task_func: public task_result<Result>, func_holder<Func> {
+	// 和之前的 result_base 一样
+    // 而且应该是覆盖了 task_result 的常量
+    // 而且只有静态成员才能在后边初始化
+	static const task_base_vtable vtable_impl;
+	template<typename... Args>
+	explicit task_func(Args&&... args)
+	{
+		this->vtable = &vtable_impl;
+		this->init_func(std::forward<Args>(args)...);
+	}
+
+	// Run the stored function
+	static void run(task_base* t) LIBASYNC_NOEXCEPT
+	{
+		LIBASYNC_TRY {
+			// Dispatch to execution function
+			static_cast<task_func<Sched, Func, Result>*>(t)->get_func()(t);
+		} LIBASYNC_CATCH(...) {
+			cancel(t, std::current_exception());
+		}
+	}
+
+	// Cancel the task
+	static void cancel(task_base* t, std::exception_ptr&& except) LIBASYNC_NOEXCEPT
+	{
+		// Destroy the function object when canceling since it won't be
+		// used anymore.
+		static_cast<task_func<Sched, Func, Result>*>(t)->destroy_func();
+		static_cast<task_func<Sched, Func, Result>*>(t)->cancel_base(std::move(except));
+	}
+
+	// Schedule a continuation task using its scheduler
+	static void schedule(task_base* parent, task_ptr t)
+	{
+		void* sched = static_cast<task_func<Sched, Func, Result>*>(t.get())->sched;
+		parent->run_continuation(*static_cast<Sched*>(sched), std::move(t));
+	}
+
+	// Free the function
+	~task_func()
+	{
+		// If the task hasn't completed yet, destroy the function object. Note
+		// that an unwrapped task has already destroyed its function object.
+		if (this->state.load(std::memory_order_relaxed) == task_state::pending)
+			this->destroy_func();
+	}
+
+	// Delete the task using its proper type
+	static void destroy(task_base* t) LIBASYNC_NOEXCEPT
+	{
+		delete static_cast<task_func<Sched, Func, Result>*>(t);
+	}
+};
+template<typename Sched, typename Func, typename Result>
+const task_base_vtable task_func<Sched, Func, Result>::vtable_impl = {
+	task_func<Sched, Func, Result>::destroy, // destroy
+	task_func<Sched, Func, Result>::run, // run
+	task_func<Sched, Func, Result>::cancel, // cancel
+	task_func<Sched, Func, Result>::schedule // schedule
+};
+#+END_SRC
+** 分离相关函数
+*** unwrapped_func 函数对象
+    将任务 t 赋值给成员变量 parent_task，调用的参数是子任务。parent_task 结果(包括异常)
+要等子任务完成。
+#+BEGIN_SRC C++
+template<typename Result, typename Child>
+struct unwrapped_func {
+	explicit unwrapped_func(task_ptr t)
+		: parent_task(std::move(t)) {}
+	void operator()(Child child_task) const
+	{
+		task_result<Result>* parent = static_cast<task_result<Result>*>(parent_task.get());
+		LIBASYNC_TRY {
+			if (get_internal_task(child_task)->state.load(std::memory_order_relaxed) == task_state::completed) {
+				parent->set_result(get_internal_task(child_task)->get_result(child_task));
+				parent->finish();
+			} else {
+                // 用 cancel_base 是因为函数对象引用计数为零已经销毁
+				parent->cancel_base(std::exception_ptr(get_internal_task(child_task)->get_exception()));
+			}
+		} LIBASYNC_CATCH(...) {
+			// 复制或移动构造时抛出异常
+			parent->cancel_base(std::current_exception());
+		}
+	}
+	task_ptr parent_task;
+};
+#+END_SRC
+*** unwrapped_finish
+#+BEGIN_SRC C++
+template<typename Sched, typename Result, typename Func, typename Child>
+void unwrapped_finish(task_base* parent_base, Child child_task)
+{
+	// Destroy the parent task's function since it has been executed
+	parent_base->state.store(task_state::unwrapped, std::memory_order_relaxed);
+	static_cast<task_func<Sched, Func, Result>*>(parent_base)->destroy_func();
+
+	// Set up a continuation on the child to set the result of the parent
+    // 在child上设置后继任务来设置parent的结果？
+	LIBASYNC_TRY {
+		parent_base->add_ref();
+		child_task.then(inline_scheduler(), unwrapped_func<Result, Child>(task_ptr(parent_base)));
+	} LIBASYNC_CATCH(...) {
+		// Use cancel_base here because the function object is already destroyed.
+		static_cast<task_result<Result>*>(parent_base)->cancel_base(std::current_exception());
+	}
+}
+#+END_SRC
+*** root 任务执行函数
+   root任务不存在父任务，所以直接使用 =detail::invoke_fake_void()== 调用本身。
+#+BEGIN_SRC C++
+template<typename Sched, typename Result, typename Func, bool Unwrap>
+struct root_exec_func: private func_base<Func> {
+	template<typename F>
+	explicit root_exec_func(F&& f)
+		: func_base<Func>(std::forward<F>(f)) {}
+	void operator()(task_base* t)
+	{
+		static_cast<task_result<Result>*>(t)->set_result(detail::invoke_fake_void(std::move(this->get_func())));
+		static_cast<task_func<Sched, root_exec_func, Result>*>(t)->destroy_func();
+		t->finish();
+	}
+};
+#+END_SRC
+*** 后继任务
+    和 root 任务人区别在于 =detail::invoke_fake_void()= 中传入了父任务。
+#+BEGIN_SRC C++
+template<typename Sched, typename Parent, typename Result, typename Func, bool ValueCont, bool Unwrap>
+struct continuation_exec_func: private func_base<Func> {
+	template<typename F, typename P>
+	continuation_exec_func(F&& f, P&& p)
+		: func_base<Func>(std::forward<F>(f)), parent(std::forward<P>(p)) {}
+	void operator()(task_base* t)
+	{
+		static_cast<task_result<Result>*>(t)->set_result(detail::invoke_fake_void(std::move(this->get_func()), std::move(parent)));
+		static_cast<task_func<Sched, continuation_exec_func, Result>*>(t)->destroy_func();
+		t->finish();
+	}
+	Parent parent;
+};
+#+END_SRC
+* 总结
+这一部分的内容还是基础的一些类，主要介绍了一个任务的另两个基类 -- 结果类和函数类。这两个类也是层层
+封装使得代码简洁，后续分析完 task 出一张 UML 图应该就可以滤清各个类之间人关系了。
