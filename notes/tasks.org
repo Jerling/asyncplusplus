@@ -1,0 +1,447 @@
+* Task 源码分析
+
+** 基类
+*** basic_task 对象
+   task 和 shared_task 对象的公共基类
+#+BEGIN_SRC C++
+template<typename Result>
+class basic_task {
+	// Reference counted internal task object
+	detail::task_ptr internal_task;
+
+	// 萃取结果的内部类型
+	typedef typename void_to_fake_void<Result>::type internal_result;
+
+	// 通过结果类型定义内部任务类型
+	typedef task_result<internal_result> internal_task_type;
+
+	// 友元成员
+	friend async::task<Result>;
+	friend async::shared_task<Result>;
+	template<typename T>
+	friend typename T::internal_task_type* get_internal_task(const T& t);
+	template<typename T>
+	friend void set_internal_task(T& t, task_ptr p);
+
+	// Common code for get()
+	void get_internal() const {...}
+
+	// Common code for then()
+	template<typename Sched, typename Func, typename Parent>
+	typename continuation_traits<Parent, Func>::task_type then_internal(Sched& sched, Func&& f, Parent&& parent) const
+	{
+		LIBASYNC_ASSERT(internal_task, std::invalid_argument, "Use of empty task object");
+
+		// Save a copy of internal_task because it might get moved into exec_func
+		task_base* my_internal = internal_task.get();
+
+		// Create continuation
+		typedef continuation_traits<Parent, Func> traits;
+		typedef typename void_to_fake_void<typename traits::task_type::result_type>::type cont_internal_result;
+		typedef continuation_exec_func<Sched, typename std::decay<Parent>::type, cont_internal_result, typename traits::decay_func, traits::is_value_cont::value, is_task<typename traits::result_type>::value> exec_func;
+		typename traits::task_type cont;
+		set_internal_task(cont, task_ptr(new task_func<Sched, exec_func, cont_internal_result>(std::forward<Func>(f), std::forward<Parent>(parent))));
+
+		// Add the continuation to this task
+		// Avoid an expensive ref-count modification since the task isn't shared yet
+		get_internal_task(cont)->add_ref_unlocked();
+		get_internal_task(cont)->sched = std::addressof(sched);
+		my_internal->add_continuation(sched, task_ptr(get_internal_task(cont)));
+
+		return cont;
+	}
+
+public:
+	bool valid() const{...} // 是否为空
+
+	bool ready() const{...} // 就绪
+
+	bool canceled() const{...} // 异常取消
+
+	void wait() const{...} // 等待完成
+
+	std::exception_ptr get_exception() const {...} // 返回异常
+};
+#+END_SRC
+basic_task 对象其他人部分很好理解，重点是 =then()= 的实现，主要用到了 =continuation_traits=
+函数，这个函数可以一步步的萃取 =continuation_exec_func= 所要求的模板参数，在[[file:result_func.org][结果函数源码]]
+已经知道作为后继任务必要的五个参数。先看一下 =continuation_traits= 的实现：
+#+BEGIN_SRC C++
+// 后继任务函数的各种形式
+template<typename Func, typename Parent, typename = decltype(std::declval<Func>()(std::declval<Parent>().get()))>
+std::true_type is_value_cont_helper(const Parent&, int, int);
+template<typename Func, typename = decltype(std::declval<Func>()())>
+std::true_type is_value_cont_helper(const task<void>&, int, int);
+template<typename Func, typename = decltype(std::declval<Func>()())>
+std::true_type is_value_cont_helper(const shared_task<void>&, int, int);
+template<typename Func, typename Parent, typename = decltype(std::declval<Func>()(std::declval<Parent>()))>
+std::false_type is_value_cont_helper(const Parent&, int, ...);
+template<typename Func, typename Parent>
+void is_value_cont_helper(const Parent&, ...);
+template<typename Parent, typename Func>
+struct continuation_traits {
+    // std::decay 可以将类型退化为除了指针的基本态, 如：int & -> int
+    // 扩展： std::is_same<type1,type2>::value 是严格的类型比较，比如int, int & 会返回false
+	typedef typename std::decay<Func>::type decay_func;
+    // std::declval 用在 decltype 表达式中，将任何类型转成应用类型方便调用成员函数(主要针对
+    // 没有默认构造函数的，返回类型的右值引用)
+	typedef decltype(detail::is_value_cont_helper<decay_func>(std::declval<Parent>(), 0, 0)) is_value_cont;
+	static_assert(!std::is_void<is_value_cont>::value, "Parameter type for continuation function is invalid for parent task type");
+    // std::continuation<B, T, F> : 若B=true 则为 T 类型，否则为 F 类型
+	typedef typename std::conditional<is_value_cont::value, typename void_to_fake_void<decltype(std::declval<Parent>().get())>::type, Parent>::type param_type;
+    // fake_void_to_void 和 invoke_fake_void 实现使用完美转发
+    // 这里根据函数和参数类型萃取结果类型
+	typedef decltype(detail::fake_void_to_void(detail::invoke_fake_void(std::declval<decay_func>(), std::declval<param_type>()))) result_type;
+    // 退去 task 封装，存取任务类型
+	typedef task<typename remove_task<result_type>::type> task_type;
+};
+#+END_SRC
+这部分理清楚了，就容易看懂 =then= 的实现了。先萃取后继任务的结果类型，然后结合萃取的其它模板参数
+创建后继任务函数并创建子任务。最后添加到自己的后边。
+*** basic_event 对象
+   这个是事件触发的任务基类。
+#+BEGIN_SRC C++
+template<typename Result>
+class basic_event {
+	// Reference counted internal task object
+	detail::task_ptr internal_task;
+
+	// Real result type, with void turned into fake_void
+	typedef typename detail::void_to_fake_void<Result>::type internal_result;
+
+	// Type-specific task object
+	typedef detail::task_result<internal_result> internal_task_type;
+
+	// Friend access
+	friend async::event_task<Result>;
+	template<typename T>
+	friend typename T::internal_task_type* get_internal_task(const T& t);
+
+	// Common code for set()
+	template<typename T>
+	bool set_internal(T&& result) const
+	{
+		LIBASYNC_ASSERT(internal_task, std::invalid_argument, "Use of empty event_task object");
+
+		// Only allow setting the value once
+		detail::task_state expected = detail::task_state::pending;
+		if (!internal_task->state.compare_exchange_strong(expected, detail::task_state::locked, std::memory_order_acquire, std::memory_order_relaxed))
+			return false;
+
+		LIBASYNC_TRY {
+			// Store the result and finish
+			get_internal_task(*this)->set_result(std::forward<T>(result));
+			internal_task->finish();
+		} LIBASYNC_CATCH(...) {
+			// At this point we have already committed to setting a value, so
+			// we can't return the exception to the caller. If we did then it
+			// could cause concurrent set() calls to fail, thinking a value has
+			// already been set. Instead, we simply cancel the task with the
+			// exception we just got.
+			get_internal_task(*this)->cancel_base(std::current_exception());
+		}
+		return true;
+	}
+
+public:
+	// 只能移动不能复制
+	basic_event(basic_event&& other) LIBASYNC_NOEXCEPT
+		: internal_task(std::move(other.internal_task)) {}
+	basic_event& operator=(basic_event&& other) LIBASYNC_NOEXCEPT
+	{
+		internal_task = std::move(other.internal_task);
+		return *this;
+	}
+
+	basic_event()
+		: internal_task(new internal_task_type)
+	{
+		internal_task->event_task_got_task = false;
+	}
+
+	// 设置前被销毁
+	~basic_event()
+	{
+		// This check isn't thread-safe but set_exception does a proper check
+		if (internal_task && !internal_task->ready() && !internal_task->is_unique_ref(std::memory_order_relaxed)) {
+#ifdef LIBASYNC_NO_EXCEPTIONS
+			// This will result in an abort if the task result is read
+			set_exception(std::exception_ptr());
+#else
+			set_exception(std::make_exception_ptr(abandoned_event_task()));
+#endif
+		}
+	}
+
+	// 取出事件任务, 只能取一次
+	task<Result> get_task()
+	{
+		LIBASYNC_ASSERT(internal_task, std::invalid_argument, "Use of empty event_task object");
+		LIBASYNC_ASSERT(!internal_task->event_task_got_task, std::logic_error, "get_task() called twice on event_task");
+
+		task<Result> out;
+		if (!internal_task->event_task_got_task)
+			set_internal_task(out, internal_task);
+		internal_task->event_task_got_task = true;
+		return out;
+	}
+
+	// 异常取消并取消后继事件任务
+	bool set_exception(std::exception_ptr except) const
+	{
+		LIBASYNC_ASSERT(internal_task, std::invalid_argument, "Use of empty event_task object");
+
+		// 这里看是否为未决态，是的话强制锁定而不是直接设置异常
+		detail::task_state expected = detail::task_state::pending;
+		if (!internal_task->state.compare_exchange_strong(expected, detail::task_state::locked, std::memory_order_acquire, std::memory_order_relaxed))
+			return false;
+
+		// Cancel the task
+		get_internal_task(*this)->cancel_base(std::move(except));
+		return true;
+	}
+};
+#+END_SRC
+** 任务对象
+*** task 对象
+#+BEGIN_SRC C++
+template<typename Result>
+class task: public detail::basic_task<Result> {
+public:
+	// 只移动
+	task() = default;
+	task(task&& other) LIBASYNC_NOEXCEPT
+		: detail::basic_task<Result>(std::move(other)) {}
+	task& operator=(task&& other) LIBASYNC_NOEXCEPT
+	{
+		detail::basic_task<Result>::operator=(std::move(other));
+		return *this;
+	}
+
+	Result get()
+	{
+		this->get_internal();
+
+		// Move the internal state pointer so that the task becomes invalid,
+		// even if an exception is thrown.
+		detail::task_ptr my_internal = std::move(this->internal_task);
+		return detail::fake_void_to_void(static_cast<typename task::internal_task_type*>(my_internal.get())->get_result(*this));
+	}
+
+	template<typename Sched, typename Func>
+	typename detail::continuation_traits<task, Func>::task_type then(Sched& sched, Func&& f){...}
+	template<typename Func>
+	typename detail::continuation_traits<task, Func>::task_type then(Func&& f){...}
+
+	// Create a shared_task from this task
+	shared_task<Result> share(){...}
+};
+#+END_SRC
+*** shared_task对象
+    与 task 不同于结果的处理方式上: 判断是否为void, 否就直接添加左值引用常量
+#+BEGIN_SRC C++
+template<typename Result>
+class shared_task: public detail::basic_task<Result> {
+	// get() return value: const Result& -or- void
+	typedef typename std::conditional<
+		std::is_void<Result>::value,
+		void,
+		typename std::add_lvalue_reference<
+			typename std::add_const<Result>::type
+		>::type
+	>::type get_result;
+
+public:
+	// Movable and copyable
+	shared_task() = default;
+
+	// Get the result of the task
+	get_result get() const {...}
+
+	// Add a continuation to the task
+	template<typename Sched, typename Func>
+	typename detail::continuation_traits<shared_task, Func>::task_type then(Sched& sched, Func&& f) const{...}
+	template<typename Func>
+	typename detail::continuation_traits<shared_task, Func>::task_type then(Func&& f) const{...}
+};
+#+END_SRC
+*** event_task对象
+    事件驱动的任务对象
+#+BEGIN_SRC C++
+template<typename Result>
+class event_task: public detail::basic_event<Result> {
+public:
+	// Movable but not copyable
+	event_task() = default;
+	event_task(event_task&& other) LIBASYNC_NOEXCEPT
+		: detail::basic_event<Result>(std::move(other)) {}
+	event_task& operator=(event_task&& other) LIBASYNC_NOEXCEPT
+	{
+		detail::basic_event<Result>::operator=(std::move(other));
+		return *this;
+	}
+
+	// 设置结果表示完成
+	bool set(const Result& result) const
+	{
+		return this->set_internal(result);
+	}
+	bool set(Result&& result) const
+	{
+		return this->set_internal(std::move(result));
+	}
+};
+#+END_SRC
+还有引用和void的偏特化版本。
+*** local_task对象
+    生成本地任务对象，该对象是有作用域的，只能在调用的范围内生存。源码分析同 task 。
+#+BEGIN_SRC C++
+template<typename Sched, typename Func>
+class local_task {
+	// 确保可调用
+	typedef typename std::decay<Func>::type decay_func;
+	static_assert(detail::is_callable<decay_func()>::value, "Invalid function type passed to local_spawn()");
+
+	// Task result type
+	typedef typename detail::remove_task<decltype(std::declval<decay_func>()())>::type result_type;
+	typedef typename detail::void_to_fake_void<result_type>::type internal_result;
+
+	// Task execution function type
+	typedef detail::root_exec_func<Sched, internal_result, decay_func, detail::is_task<decltype(std::declval<decay_func>()())>::value> exec_func;
+
+	// Task object embedded directly. The ref-count is initialized to 1 so it
+	// will never be freed using delete, only when the local_task is destroyed.
+	detail::task_func<Sched, exec_func, internal_result> internal_task;
+
+	// Friend access for local_spawn
+	template<typename S, typename F>
+	friend local_task<S, F> local_spawn(S& sched, F&& f);
+	template<typename F>
+	friend local_task<detail::default_scheduler_type, F> local_spawn(F&& f);
+
+	// Constructor, used by local_spawn
+	local_task(Sched& sched, Func&& f)
+		: internal_task(std::forward<Func>(f))
+	{
+		// Avoid an expensive ref-count modification since the task isn't shared yet
+		internal_task.add_ref_unlocked();
+		detail::schedule_task(sched, detail::task_ptr(&internal_task));
+	}
+
+public:
+	// Non-movable and non-copyable
+	local_task(const local_task&) = delete;
+	local_task& operator=(const local_task&) = delete;
+
+	// Wait for the task to complete when destroying
+	~local_task()
+	{
+		wait();
+		while (!internal_task.is_unique_ref(std::memory_order_acquire)) {
+#if defined(__GLIBCXX__) && __GLIBCXX__ <= 20140612
+			sched_yield();
+#else
+			std::this_thread::yield();  // 自旋等待引用为1
+#endif
+		}
+	}
+
+	bool ready() const{...}
+
+	bool canceled() const{...}
+
+	void wait(){...}
+
+	result_type get(){...}
+
+	std::exception_ptr get_exception() const{...}
+};
+#+END_SRC
+** 异步孵化函数
+*** spawn
+    生成任务对象。
+#+BEGIN_SRC C++
+template<typename Sched, typename Func>
+task<typename detail::remove_task<typename std::result_of<typename std::decay<Func>::type()>::type>::type> spawn(Sched& sched, Func&& f)
+{
+     // std::result_of编译器推导可调用对象的返回类型
+	typedef typename std::decay<Func>::type decay_func;
+	static_assert(detail::is_callable<decay_func()>::value, "Invalid function type passed to spawn()");
+
+	// 创建任务
+	typedef typename detail::void_to_fake_void<typename detail::remove_task<decltype(std::declval<decay_func>()())>::type>::type internal_result;
+	typedef detail::root_exec_func<Sched, internal_result, decay_func, detail::is_task<decltype(std::declval<decay_func>()())>::value> exec_func;
+	task<typename detail::remove_task<decltype(std::declval<decay_func>()())>::type> out;
+	detail::set_internal_task(out, detail::task_ptr(new detail::task_func<Sched, exec_func, internal_result>(std::forward<Func>(f))));
+
+	// Avoid an expensive ref-count modification since the task isn't shared yet
+	detail::get_internal_task(out)->add_ref_unlocked();
+	detail::schedule_task(sched, detail::task_ptr(detail::get_internal_task(out)));
+
+	return out;
+}
+#+END_SRC
+默认调度器版本：
+#+BEGIN_SRC C++
+template<typename Func>
+decltype(async::spawn(::async::default_scheduler(), std::declval<Func>())) spawn(Func&& f)
+{
+	return async::spawn(::async::default_scheduler(), std::forward<Func>(f));
+}
+#+END_SRC
+*** make_task
+    创建一个包含一个值的完成任务。
+#+BEGIN_SRC C++
+template<typename T>
+task<typename std::decay<T>::type> make_task(T&& value)
+{
+	task<typename std::decay<T>::type> out;
+
+	detail::set_internal_task(out, detail::task_ptr(new detail::task_result<typename std::decay<T>::type>));
+	detail::get_internal_task(out)->set_result(std::forward<T>(value));
+	detail::get_internal_task(out)->state.store(detail::task_state::completed, std::memory_order_relaxed);
+
+	return out;
+}
+#+END_SRC
+该函数还有引用和void特化版本。
+*** make_exception_task
+    创建包含异常的取消任务。
+#+BEGIN_SRC C++
+template<typename T>
+task<T> make_exception_task(std::exception_ptr except)
+{
+	task<T> out;
+
+	detail::set_internal_task(out, detail::task_ptr(new detail::task_result<typename detail::void_to_fake_void<T>::type>));
+	detail::get_internal_task(out)->set_exception(std::move(except));
+	detail::get_internal_task(out)->state.store(detail::task_state::canceled, std::memory_order_relaxed);
+
+	return out;
+}
+#+END_SRC
+*** local_spawn
+    创建本地task。
+#+BEGIN_SRC C++
+template<typename Sched, typename Func>
+#ifdef __GNUC__
+__attribute__((warn_unused_result))
+#endif
+local_task<Sched, Func> local_spawn(Sched& sched, Func&& f)
+{
+    // 不可移动，所以可以直接原地构造
+    // 获取结果只能通过引用:  auto&& x = local_spawn(...);
+	return {sched, std::forward<Func>(f)};
+}
+template<typename Func>
+#ifdef __GNUC__
+__attribute__((warn_unused_result))
+#endif
+local_task<detail::default_scheduler_type, Func> local_spawn(Func&& f)
+{
+	return {::async::default_scheduler(), std::forward<Func>(f)};
+}
+#+END_SRC
+** 总结
+   这部分把任务相关的对象分析完毕，各种关系可以通过 UML 图搞清楚，下次做个阶段性的总结。之后就是
+分析调度器的内容。
