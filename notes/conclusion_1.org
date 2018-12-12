@@ -50,6 +50,7 @@ the result from async task1
 
 
 最后看一下线程的大概模型图：
+
 [[file:images/Snipaste_2018-12-12_16-07-21.png]]
 
 在主线程中调用 spawn 函数就创建一个子线程，这个线程创建完成后就可以和主线程并发执行。
