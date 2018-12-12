@@ -1,0 +1,57 @@
+* 4. Task 阶段性总结
+** Task_base 相关类的关系
+  首先总结一下在分析 task_base 源码的时候各个类的关系：
+
+[[file:images/Snipaste_2018-12-12_17-00-20.png]]
+
+从上面的 UML 图可以大概知道什么时候是什么类型的对象在活动。
+** Task 相关类
+   Task 相关的类封装了 task_base 类。
+
+[[file:images/Snipaste_2018-12-12_17-20-01.png]]
+** 简单例子
+#+BEGIN_SRC C++
+#include <iostream>
+#include <async++.h>
+using namespace std;
+
+int main()
+{
+    auto t1 = async::spawn([]() -> std::string {
+        std::cout<<"async task1"<< std::endl;
+        return "the result from async task1";
+    });
+    auto t2 = async::spawn([]() -> std::string {
+        std::cout<<"async task2"<< std::endl;
+        return "the result from async task2";
+    });
+    cout << t1.get() << endl;
+    cout << "main task" << endl;
+    cout << t2.get() << endl;
+    return 0;
+}
+#+END_SRC
+
+- 结果:
+#+BEGIN_SRC bash
+g++ test.cc -std=c++14 -lasync++ -pthread -o /tmp/test && time /tmp/test
+async task1async task2
+
+the result from async task2
+main task
+the result from async task1
+#+END_SRC
+
+可以看 =task1= 和 =task2= 以及 =main= 是同步进行：
+
+1. =task1= 输出完来不及刷新输出缓冲，就切换到 task2。然后后面连续是两个刷新。
+2. =main= 线程本可以最先执行，但是使用 =get()= 方法等待结果会陷入阻塞态。
+3. 得到结果后意味着子线程全部退出，然后主线程执行完退出。
+
+
+最后看一下线程的大概模型图：
+[[file:images/Snipaste_2018-12-12_16-07-21.png]]
+
+在主线程中调用 spawn 函数就创建一个子线程，这个线程创建完成后就可以和主线程并发执行。
+创建的时候首先将任务函数接到任务上，然后获取任务。最后就是通过一个调度器负责管理线程。
+线程管理这一部分的源码还没有看，后续补充。
