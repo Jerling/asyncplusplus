@@ -1,0 +1,406 @@
+* 调度器前篇
+  这部分源码来源于 =schduler_fwd.h= 头文件。
+
+- 检测调度器
+#+BEGIN_SRC C++
+// from traits.h
+// Check if a type is callable with the given arguments
+typedef char one[1];
+typedef char two[2];
+
+template<typename T, typename = decltype(std::declval<T>().schedule(std::declval<task_run_handle>()))>
+two& is_scheduler_helper(int); template<typename T>
+one& is_scheduler_helper(...);
+
+// std::integral_constant 定义一个编译时常量（可以是bool、int、char）
+// 简单用法：
+// using const_bool = std::integral_constant<int, 3>;
+// 则通过: const_bool::value 可以访问其值
+template<typename T>
+struct is_scheduler: public std::integral_constant<bool, sizeof(is_scheduler_helper<T>(0)) - 1> {};
+#+END_SRC
+
+** 调度器分类
+   从调试器的给的接口大致分四类：单线程调度器、内联调度器、队列调度器、线程池调度器。
+
+*** 单线程调度器
+    这个实现应该是把调度的工件交给了 task_run_handle 对象。
+#+BEGIN_SRC C++
+// Singleton scheduler classes
+class thread_scheduler_impl {
+public:
+	LIBASYNC_EXPORT static void schedule(task_run_handle t);
+};
+// 这个调度器不会等待其它线程，直接退出
+inline detail::thread_scheduler_impl& thread_scheduler()
+{
+	static detail::thread_scheduler_impl instance;
+	return instance;
+}
+#+END_SRC
+
+*** 内联调度器
+#+BEGIN_SRC C++
+class inline_scheduler_impl {
+public:
+	static void schedule(task_run_handle t);
+};
+// Run a task in the current thread as soon as it is scheduled
+inline detail::inline_scheduler_impl& inline_scheduler()
+{
+	static detail::inline_scheduler_impl instance;
+	return instance;
+}
+#+END_SRC
+
+*** 队列调度器
+#+BEGIN_SRC C++
+class fifo_scheduler {
+	struct internal_data;
+	std::unique_ptr<internal_data> impl;
+
+public:
+	LIBASYNC_EXPORT fifo_scheduler();
+	LIBASYNC_EXPORT ~fifo_scheduler();
+
+	// Add a task to the queue
+	LIBASYNC_EXPORT void schedule(task_run_handle t);
+
+	// Try running one task from the queue. Returns false if the queue was empty.
+	LIBASYNC_EXPORT bool try_run_one_task();
+
+	// Run all tasks in the queue
+	LIBASYNC_EXPORT void run_all_tasks();
+};
+#+END_SRC
+从队列调度器的接口中可以看到，该调度器维护一个内部数据 =internal_data= ，定义如下：
+#+BEGIN_SRC C++
+struct fifo_scheduler::internal_data {
+	detail::fifo_queue queue;
+	std::mutex lock;
+};
+#+END_SRC
+进一步挖掘，fifo_queue的实现：
+#+BEGIN_SRC C++
+class fifo_queue {
+    // 这里为了兼容任意任务而使用 void*, 为啥不用模板?
+	detail::aligned_array<void*, LIBASYNC_CACHELINE_SIZE> items;
+	std::size_t head, tail;
+
+public:
+	fifo_queue()
+		: items(32), head(0), tail(0) {}
+	~fifo_queue()
+	{
+		// Free any unexecuted tasks
+		for (std::size_t i = head; i != tail; i = (i + 1) & (items.size() - 1))
+			task_run_handle::from_void_ptr(items[i]);
+	}
+
+	// Push a task to the end of the queue
+	void push(task_run_handle t)
+	{
+		// 这里的 items.size() - 1 等于 31 为全1，& 位运算可以实现取模
+		if (head == ((tail + 1) & (items.size() - 1))) {
+			detail::aligned_array<void*, LIBASYNC_CACHELINE_SIZE> new_items(items.size() * 2);
+			for (std::size_t i = 0; i != items.size(); i++)
+				new_items[i] = items[(i + head) & (items.size() - 1)];
+			head = 0;
+			tail = items.size() - 1;
+			items = std::move(new_items);
+		}
+
+		// Push the item
+		items[tail] = t.to_void_ptr();
+		tail = (tail + 1) & (items.size() - 1);
+	}
+
+	// Pop a task from the front of the queue
+	task_run_handle pop()
+	{
+		// See if an item is available
+		if (head == tail)
+			return task_run_handle();
+		else {
+			void* x = items[head];
+			head = (head + 1) & (items.size() - 1);
+			return task_run_handle::from_void_ptr(x);
+		}
+	}
+};
+#+END_SRC
+这里作者没有使用安全队列 ， 所以保证数据安全的任务就交给了调度器。
+
+回到调度器：
+#+BEGIN_SRC C++
+// 添加到队列
+void fifo_scheduler::schedule(task_run_handle t)
+{
+	std::lock_guard<std::mutex> locked(impl->lock);
+	impl->queue.push(std::move(t));
+}
+// 取出任务并执行
+bool fifo_scheduler::try_run_one_task()
+{
+	task_run_handle t;
+	{
+		std::lock_guard<std::mutex> locked(impl->lock);
+		t = impl->queue.pop();
+	}
+	if (t) {
+		t.run();
+		return true;
+	}
+	return false;
+}
+void fifo_scheduler::run_all_tasks()
+{
+	while (try_run_one_task()) {}
+}
+#+END_SRC
+
+*** 线程池调度器
+    维护一个线程池，这些任务是可抢断的。
+#+BEGIN_SRC C++
+class threadpool_scheduler {
+	std::unique_ptr<detail::threadpool_data> impl;
+
+public:
+	LIBASYNC_EXPORT threadpool_scheduler(threadpool_scheduler&& other);
+
+	// Create a thread pool with the given number of threads
+	LIBASYNC_EXPORT threadpool_scheduler(std::size_t num_threads);
+
+	// Create a thread pool with the given number of threads. Call `prerun`
+    // function before execution loop and `postrun` after.
+	LIBASYNC_EXPORT threadpool_scheduler(std::size_t num_threads,
+                                         std::function<void()>&& prerun_,
+                                         std::function<void()>&& postrun_);
+
+	// Destroy the thread pool, tasks that haven't been started are dropped
+	LIBASYNC_EXPORT ~threadpool_scheduler();
+
+	// Schedule a task to be run in the thread pool
+	LIBASYNC_EXPORT void schedule(task_run_handle t);
+};
+#+END_SRC
+
+*** 线程池调度器
+    该调度器使用线程池。
+
+**** 数据结构
+#+BEGIN_SRC C++
+struct threadpool_data {
+ threadpool_data(std::size_t num_threads)
+	 : thread_data(num_threads), shutdown(false), num_waiters(0), waiters(new task_wait_event*[num_threads]) {}
+
+    threadpool_data(std::size_t num_threads, std::function<void()>&& prerun_, std::function<void()>&& postrun_)
+	 : thread_data(num_threads), shutdown(false), num_waiters(0), waiters(new task_wait_event*[num_threads]),
+          prerun(std::move(prerun_)), postrun(std::move(postrun_)) {}
+
+ // 维护数据的全局锁
+ std::mutex lock;
+
+ // Array of per-thread data
+ aligned_array<thread_data_t> thread_data;
+
+ // 池外等待队列
+ fifo_queue public_queue;
+
+ // 关闭线程池请求
+ bool shutdown;
+
+ // List of threads waiting for tasks to run. num_waiters needs to be atomic
+ // because it is sometimes read outside the mutex.
+ std::atomic<std::size_t> num_waiters;
+ std::unique_ptr<task_wait_event*[]> waiters;
+
+ // Pre/Post run functions.
+    std::function<void()> prerun;
+    std::function<void()> postrun;
+
+#ifdef BROKEN_JOIN_IN_DESTRUCTOR
+ // Shutdown complete event, used instead of thread::join()
+ std::size_t shutdown_num_threads;
+ std::condition_variable shutdown_complete_event;
+#endif
+};
+#+END_SRC
+
+每个线程的数据：
+#+BEGIN_SRC C++
+struct LIBASYNC_CACHELINE_ALIGN thread_data_t {
+ work_steal_queue queue;
+ std::minstd_rand rng;   // 随机数生成引擎
+ task_wait_event event;
+ std::thread handle;
+};
+#+END_SRC
+线程数据包装器：
+#+BEGIN_SRC C++
+struct threadpool_data_wrapper {
+ threadpool_data* owning_threadpool;
+ std::size_t thread_id;
+
+ threadpool_data_wrapper(threadpool_data* owning_threadpool, std::size_t thread_id):
+	 owning_threadpool(owning_threadpool), thread_id(thread_id) { }
+};
+#+END_SRC
+
+**** 调度池实现
+#+BEGIN_SRC C++
+// std::unique_ptr<detail::threadpool_data> impl;
+// 转移已存在的线程池
+threadpool_scheduler::threadpool_scheduler(threadpool_scheduler&& other)
+        : impl(std::move(other.impl)) {}
+// 递归创建大小为 N 的线程池
+threadpool_scheduler::threadpool_scheduler(std::size_t num_threads)
+	: impl(new detail::threadpool_data(num_threads))
+{
+	// 设置第一个线程人句柄
+	impl->thread_data[0].handle = std::thread(detail::recursive_spawn_worker_thread, impl.get(), 0, num_threads);
+}
+
+threadpool_scheduler::threadpool_scheduler(std::size_t num_threads,
+                                           std::function<void()>&& prerun,
+                                           std::function<void()>&& postrun)
+    : impl(new detail::threadpool_data(num_threads, std::move(prerun), std::move(postrun)))
+{
+	impl->thread_data[0].handle = std::thread(detail::recursive_spawn_worker_thread, impl.get(), 0, num_threads);
+}
+
+
+// 等待所有任务完成
+threadpool_scheduler::~threadpool_scheduler(){ ... }
+
+// 调度
+void threadpool_scheduler::schedule(task_run_handle t)
+{
+	detail::threadpool_data_wrapper wrapper = detail::get_threadpool_data_wrapper();
+
+	// 检查是否在同一个线程池
+	if (wrapper.owning_threadpool == impl.get()) {
+		impl->thread_data[wrapper.thread_id].queue.push(std::move(t));
+        // 没有任务直接返回
+		if (impl->num_waiters.load(std::memory_order_relaxed) == 0)
+			return;
+
+		std::lock_guard<std::mutex> locked(impl->lock);
+
+		size_t num_waiters_val = impl->num_waiters.load(std::memory_order_relaxed);
+		if (num_waiters_val == 0)
+			return;
+
+		// 唤醒任务
+		impl->waiters[num_waiters_val - 1]->signal(detail::wait_type::task_available);
+		impl->num_waiters.store(num_waiters_val - 1, std::memory_order_relaxed);
+	} else {
+		std::lock_guard<std::mutex> locked(impl->lock);
+
+		// Push task onto the public queue
+		impl->public_queue.push(std::move(t));
+
+		// Wake up a sleeping thread
+		size_t num_waiters_val = impl->num_waiters.load(std::memory_order_relaxed);
+		if (num_waiters_val == 0)
+			return;
+		impl->waiters[num_waiters_val - 1]->signal(detail::wait_type::task_available);
+		impl->num_waiters.store(num_waiters_val - 1, std::memory_order_relaxed);
+	}
+}
+#+END_SRC
+
+**** 调度实现
+     贴出调度的主要函数。
+#+BEGIN_SRC C++
+static void thread_task_loop(threadpool_data* impl, std::size_t thread_id, task_wait_handle wait_task)
+{
+	// 获取当前线程数据
+	thread_data_t& current_thread = impl->thread_data[thread_id];
+
+	// 是否添加后继任务
+	bool added_continuation = false;
+
+	// 主循环等待任务完成
+	while (true) {
+		// 检查等待的任务是否完成，是否添加后继任务
+		// 添加则检查等待事件是否满足，否则当前任务是否就绪
+		if (wait_task && (added_continuation ? current_thread.event.try_wait(wait_type::task_finished) : wait_task.ready()))
+			return;
+
+		// 先从自己的线程队列获取任务
+		if (task_run_handle t = current_thread.queue.pop()) {
+			t.run();
+			continue;
+		}
+
+		// 获取失败，从别的线程队列窃取任务
+		while (true) {
+			if (task_run_handle t = steal_task(impl, thread_id)) {
+				t.run();
+				break;
+			}
+
+			// 以上失败，则从公共队列中获取任务
+			std::unique_lock<std::mutex> locked(impl->lock);
+			if (task_run_handle t = impl->public_queue.pop()) {
+				// 在任务执行前务必释放锁，否则别的线程无法从公共队列获取任务。
+				locked.unlock();
+				t.run();
+				break;
+			}
+
+			// 关闭线程池请求并且没有任务了就退出
+			if (!wait_task && impl->shutdown) {
+#ifdef BROKEN_JOIN_IN_DESTRUCTOR
+				// Notify once all worker threads have exited
+				if (--impl->shutdown_num_threads == 0)
+					impl->shutdown_complete_event.notify_one();
+#endif
+				return;
+			}
+
+			// 没有任务睡眠等待事件
+			// 设置后继任务为设为事件回调
+			if (wait_task && !added_continuation) {
+				task_wait_event& event = current_thread.event;
+				wait_task.on_finish([&event] {
+					event.signal(wait_type::task_finished);
+				});
+				added_continuation = true;
+			}
+
+			// 将事件加到线程池队列
+			size_t num_waiters_val = impl->num_waiters.load(std::memory_order_relaxed);
+			impl->waiters[num_waiters_val] = &current_thread.event;
+			impl->num_waiters.store(num_waiters_val + 1, std::memory_order_relaxed);
+
+			locked.unlock();
+            // 等待被调度, 此处会进入睡眠等待
+			int events = current_thread.event.wait();
+			locked.lock();
+
+			// 从线程池等待队列中激活
+			num_waiters_val = impl->num_waiters.load(std::memory_order_relaxed);
+			for (std::size_t i = 0; i < num_waiters_val; i++) {
+				if (impl->waiters[i] == &current_thread.event) {
+					if (i != num_waiters_val - 1)
+						std::swap(impl->waiters[i], impl->waiters[num_waiters_val - 1]);
+					impl->num_waiters.store(num_waiters_val - 1, std::memory_order_relaxed);
+					break;
+				}
+			}
+
+			// Check again if the task has finished
+			if (wait_task && (events & wait_type::task_finished))
+				return;
+		}
+	}
+}
+#+END_SRC
+
+** 总结
+   这部分分析了调度器的源码，主要还是调度的过程：先从当前线程队列中获取任务，
+然后搜索别的线程队列，最后才会搜索公共队列。如何都没有任务的话，该线程会将激活
+事件注册到线程池，自己则进入睡眠状态。一旦该事件信号发生，则继续调度执行任务。
+这里面涉及的比较多的是运行任务句柄和等待任务句柄。这两个下次分析

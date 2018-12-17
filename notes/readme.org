@@ -97,3 +97,6 @@ int main()
 [[file:tasks.org][3. Task 源码分析]]
 
 [[file:conclusion_1.org][4. Task 阶段性总结]]
+
+*** 调度器
+[[file:scheduler_fed.org][1. 调度器前篇]]
