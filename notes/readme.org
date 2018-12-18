@@ -100,3 +100,5 @@ int main()
 
 *** 调度器
 [[file:scheduler_fed.org][1. 调度器前篇]]
+
+[[file:scheduler.org][2. 调度对象]]

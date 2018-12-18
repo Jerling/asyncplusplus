@@ -1,0 +1,118 @@
+* 调度对象
+  本章节介绍调度器的调度对象 task_run_handle 和 task_wait_handle.
+** task_run_handle 对象
+   任务运行句柄，和 task_ptr 操作 task 的功能一样，在调度器中通过控制句柄来控制运行中的任务。
+#+BEGIN_SRC C++
+class task_run_handle {
+	detail::task_ptr handle;
+
+	// 允许在schedule_task()中构造
+	template<typename Sched>
+	friend void detail::schedule_task(Sched& sched, detail::task_ptr t);
+	explicit task_run_handle(detail::task_ptr t)
+		: handle(std::move(t)) {}
+
+public:
+	// 只能移动不能提制
+	task_run_handle() = default;
+	task_run_handle(task_run_handle&& other) LIBASYNC_NOEXCEPT
+		: handle(std::move(other.handle)) {}
+	task_run_handle& operator=(task_run_handle&& other) LIBASYNC_NOEXCEPT
+	{
+		handle = std::move(other.handle);
+		return *this;
+	}
+
+	// 未执行则取消
+	~task_run_handle()
+	{
+		if (handle)
+			handle->vtable->cancel(handle.get(), std::make_exception_ptr(task_not_executed()));
+	}
+
+	// 是否有效
+	explicit operator bool() const
+	{
+		return handle != nullptr;
+	}
+
+	// 运行任务后置空句柄
+	void run()
+	{
+		handle->vtable->run(handle.get());
+		handle = nullptr;
+	}
+
+	// 设置等待的句柄
+	void run_with_wait_handler(wait_handler handler)
+	{
+		wait_handler old = set_thread_wait_handler(handler);
+		run();
+		set_thread_wait_handler(old);
+	}
+    // 置空
+	void* to_void_ptr()
+	{
+		return handle.release();
+	}
+	static task_run_handle from_void_ptr(void* ptr)
+	{
+		return task_run_handle(detail::task_ptr(static_cast<detail::task_base*>(ptr)));
+	}
+};
+#+END_SRC
+** task_wait_handle
+#+BEGIN_SRC C++
+class task_wait_handle {
+	detail::task_base* handle;
+
+	// Allow construction in wait_for_task()
+	friend LIBASYNC_EXPORT void detail::wait_for_task(detail::task_base* t);
+	task_wait_handle(detail::task_base* t)
+		: handle(t) {}
+
+	// Execution function for use by wait handlers
+	template<typename Func>
+	struct wait_exec_func: private detail::func_base<Func> {
+		template<typename F>
+		explicit wait_exec_func(F&& f)
+			: detail::func_base<Func>(std::forward<F>(f)) {}
+		void operator()(detail::task_base*)
+		{
+			// Just call the function directly, all this wrapper does is remove
+			// the task_base* parameter.
+			this->get_func()();
+		}
+	};
+
+public:
+	task_wait_handle()
+		: handle(nullptr) {}
+
+	// Check if the handle is valid
+	explicit operator bool() const
+	{
+		return handle != nullptr;
+	}
+
+	// Check if the task has finished executing
+	bool ready() const
+	{
+		return detail::is_finished(handle->state.load(std::memory_order_acquire));
+	}
+
+	// 此任务完成后要完成的任务
+	template<typename Func>
+	void on_finish(Func&& func)
+	{
+		// Make sure the function type is callable
+		static_assert(detail::is_callable<Func()>::value, "Invalid function type passed to on_finish()");
+
+		auto cont = new detail::task_func<typename std::remove_reference<decltype(inline_scheduler())>::type, wait_exec_func<typename std::decay<Func>::type>, detail::fake_void>(std::forward<Func>(func));
+		cont->sched = std::addressof(inline_scheduler());
+		handle->add_continuation(inline_scheduler(), detail::task_ptr(cont));
+	}
+};
+#+END_SRC
+** 总结
+   这两部分的内容是对 task_ptr 的进一步封装成 handle, 然后将这个 handle 传给调试器进行调度。
