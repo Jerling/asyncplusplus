@@ -102,3 +102,68 @@ int main()
 [[file:scheduler_fed.org][1. 调度器前篇]]
 
 [[file:scheduler.org][2. 调度对象]]
+
+*** 实例
+1. Hello World:
+#+BEGIN_SRC C++
+#include <iostream>
+#include <async++.h>
+using namespace std;
+void fun(int *p)
+{
+    auto pp=p;
+    cout << &p << endl;
+    cout << &pp << endl;
+}
+int main(){
+    auto t = async::spawn([](){cout<<"Hello Wolrd!"<<endl;});
+    return 0;
+}
+#+END_SRC
+- Output:
+#+BEGIN_SRC bash
+g++ -std=c++11 -pthread -lasync++  -g t*.cc -o /tmp/test && time /tmp/test
+Hello Wolrd!
+/tmp/test  0.00s user 0.00s system 31% cpu 0.010 total
+#+END_SRC
+- 函数调用过程时序图：
+#+BEGIN_SRC plantuml :file images/hello_world.png
+:Ready;
+:main();
+:async::spawn();
+:default_scheduler()]
+:default_threadpool_scheduler()]
+:detail::singleton<detail::default_scheduler_impl>::get_instance()]
+:default_scheduler_impl()]
+:threadpool_scheduler(get_num_threads())]
+:std::thread(detail::recursive_spawn_worker_thread, impl.get(), 0, num_threads)]
+:impl->thread_data[0].handle.detach()]
+fork
+ :detail::recursive_spawn_worker_thread]
+ :worker_thread(impl, index)]
+ :create_threadpool_data(owning_threadpool, thread_id)]
+ :owning_threadpool->prerun()]
+ :thread_task_loop(owning_threadpool, thread_id, task_wait_handle())]
+ :owning_threadpool->postrun()]
+fork again
+ :task()]
+ :basic_task()]
+ :tasK_func()]
+ split
+  :task_result()]
+  :task_result_holder()]
+ split again
+  :func_holder()]
+  :func_base()]
+ end split
+ :task_base()]
+ :set_internal_task()]
+ :detail::get_internal_task(out)->add_ref_unlocked()]
+ :schedule_task()]
+ :sched.schedule(task_run_handle()))]
+end fork
+:finish;
+#+END_SRC
+
+#+RESULTS:
+[[file:images/hello_world.png]]
