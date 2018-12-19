@@ -127,6 +127,7 @@ Hello Wolrd!
 /tmp/test  0.00s user 0.00s system 31% cpu 0.010 total
 #+END_SRC
 - 函数调用过程时序图：
+#+BEGIN_COMMENT:
 #+BEGIN_SRC plantuml :file images/hello_world.png
 :Ready;
 :main();
@@ -166,4 +167,5 @@ end fork
 #+END_SRC
 
 #+RESULTS:
+#+END_COMMENT:
 [[file:images/hello_world.png]]
