@@ -126,7 +126,6 @@ g++ -std=c++11 -pthread -lasync++  -g t*.cc -o /tmp/test && time /tmp/test
 Hello Wolrd!
 /tmp/test  0.00s user 0.00s system 31% cpu 0.010 total
 #+END_SRC
-- 函数调用过程时序图：
 #+BEGIN_COMMENT:
 #+BEGIN_SRC plantuml :file images/hello_world.png
 :Ready;
@@ -168,4 +167,6 @@ end fork
 
 #+RESULTS:
 #+END_COMMENT
+
+- 函数调用过程时序图：
 [[file:images/hello_world.png]]
