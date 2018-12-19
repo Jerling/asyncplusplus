@@ -167,5 +167,5 @@ end fork
 #+END_SRC
 
 #+RESULTS:
-#+END_COMMENT:
+#+END_COMMENT
 [[file:images/hello_world.png]]
