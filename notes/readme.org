@@ -242,6 +242,7 @@ note right: 和task3一样作为后继任务
 
 #+RESULTS:
 #+END_COMMENT
+
 [[file:images/task_control.png]]
 
 3. 并行计算
