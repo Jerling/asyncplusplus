@@ -170,3 +170,166 @@ end fork
 
 - 函数调用过程时序图：
 [[file:images/hello_world.png]]
+
+2. 线程控制
+#+BEGIN_SRC C++ : -n
+#include <iostream>
+#include <async++.h>
+
+int main()
+{
+    auto task1 = async::spawn([] {
+        std::cout << "Task 1 executes asynchronously" << std::endl;
+    });
+    auto task2 = async::spawn([]() -> int {
+        std::cout << "Task 2 executes in parallel with task 1" << std::endl;
+        return 42;
+    });
+    auto task3 = task2.then([](int value) -> int {
+        std::cout << "Task 3 executes after task 2, which returned "
+                  << value << std::endl;
+        return value * 3;
+    });
+    auto task4 = async::when_all(task1, task3);
+    auto task5 = task4.then([](std::tuple<async::task<void>,
+                                          async::task<int>> results) {
+        std::cout << "Task 5 executes after tasks 1 and 3. Task 3 returned "
+                  << std::get<1>(results).get() << std::endl;
+    });
+
+    task5.get();
+    std::cout << "Task 5 has completed" << std::endl;
+    return 0;
+}
+#+END_SRC
+- 结果：
+#+BEGIN_SRC bash
+g++ -std=c++11 -pthread -lasync++  -g t*.cc -o /tmp/test && time /tmp/test
+Task 1 executes asynchronously
+Task 2 executes in parallel with task 1
+Task 3 executes after task 2, which returned 42
+Task 5 executes after tasks 1 and 3. Task 3 returned 126
+Task 5 has completed
+/tmp/test  0.02s user 0.00s system 63% cpu 0.031 total
+#+END_SRC
+- 运行过程：
+#+BEGIN_COMMENT
+#+BEGIN_SRC plantuml :file images/task_control.png
+:Ready;
+fork
+ :task1 is running]
+fork again
+ :task2 is running]
+ :task::then()]
+ note left: task1启动时已经有了线程池，此时只需要将任务加到 task2 后继队列中
+ :task::internal_then()]
+ :task3 is running]
+end fork
+
+:when_all()]
+note right: task4 等待 task1 和 task3
+:when_all_state()]
+note right: 创建共享状态
+:event_task()]
+:basic_task()]
+:detail::when_all_variadic()]
+note right: 将所有的任务注册到给定的事件
+:task4 is runinng]
+:task5 is running]
+note right: 和task3一样作为后继任务
+:Return;
+#+END_SRC
+
+#+RESULTS:
+#+END_COMMENT
+[[file:images/task_control.png]]
+
+3. 并行计算
+#+BEGIN_SRC C++
+
+#include <iostream>
+#include <async++.h>
+
+int main()
+{
+    async::parallel_invoke([] {
+        std::cout << "This is executed in parallel..." << std::endl;
+    }, [] {
+        std::cout << "with this" << std::endl;
+    });
+
+    async::parallel_for(async::irange(0, 5), [](int x) {
+        std::cout << x;
+    });
+    std::cout << std::endl;
+
+    int r = async::parallel_reduce({1, 2, 3, 4}, 0, [](int x, int y) {
+        return x + y;
+    });
+    std::cout << "The sum of {1, 2, 3, 4} is " << r << std::endl;
+    return 0;
+}
+#+END_SRC
+- 结果：
+#+BEGIN_SRC bash
+g++ -std=c++11 -pthread -lasync++  -g t*.cc -o /tmp/test && time /tmp/test
+This is executed in parallel...
+with this
+01234
+The sum of {1, 2, 3, 4} is 10
+/tmp/test  0.00s user 0.00s system 35% cpu 0.014 total
+#+END_SRC
+- 运行过程：
+#+BEGIN_COMMENT
+#+BEGIN_SRC plantuml :file images/parallel_computer.png
+:Ready;
+fork
+ :default_scheduler();
+ fork again
+ :async::parallel_invoke();
+ :std::forward_as_tuple();
+ :parallel_invoke_inernal();
+ note left: 递归创建并行任务
+ :local_spawn();
+ note left: 返回右值引用
+ :local_task();
+ note left: 后边的操作和 task 相差不多
+ :func_task();
+ :result_func();
+ :result_base();
+ :result_holder();
+ :run();
+ note left:根据任务索引并行执行
+fork again
+ :async::parallel_for();
+ :detail::auto_partitioner();
+ note left:自动分区，小于等于2048
+ :detail::auto_grain_size();
+ note left:grain = dist / (8 * hardware_concurrency())
+ :func();
+ note left:调用函数依次对分区进行操作
+fork again
+ :async::parallel_reduce();
+ note left:这个过程和上面的一样
+end fork
+:Return;
+#+END_SRC
+
+#+RESULTS:
+#+END_COMMENT
+
+[[file:images/parallel_computer.png]]
+
+** 总结
+   至此，官方给定的实例的调用过程分析完毕，源代码分析也差不多了。async++并发库的对C++标准库 thread 进行封装，使用起来也是很方便。
+回忆一下代码中的一些不知道的编程技巧：
+1. 内存对齐：提高内在访问速度，参考《深入理解计算机系统》。
+2. std::decay: 脱掉对象的外套(指针、引用等)， 和 std::is_same 相反，它是严格的对象比较。
+3. 封装：作者把实现细节放在 detail 命名空间，对外只是正式开放 async 命名空间。其次是实现与接口的分离。
+4. 继承：各个类的继承关系和功能划分的比较好，如将 result 和 func 类型分开让函数对象和返回类型解耦合。
+5. 自动计数引用：防止多线程下遗漏指针或引用而导致的未定义行为。
+6. 队列调度器中的队列大小预分配32(2的闵幂次方)的大小，每次扩张自动翻倍。一来可以防止频繁分配内存，二来便于位操作。
+7. 线程池技术：该过程比较复杂，调度的时候分为三个梯度：自己的队列、其它线程的队列、公共队列。任务刚创建的时候放在公共队列。
+8. 泛型编程：该库运用大量的 traits 技术，看的时候挺费劲，可能是自己对泛型编程不够了解。
+9. 内在管理：作者自己实现的内在分配，也就是重载了 operator new 函数。
+10. 最后说下文件的组织：这个库的明显特征是头文件比较多，可能是运用泛型编程技巧使得代码很少，大部分功能都在 include 中的头文件中已实现，一些比较复杂的功能在 src 中，如：线程池。
